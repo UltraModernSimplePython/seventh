@@ -4491,7 +4491,7 @@ packages:
   name: seventh
   version: 0.1.0
   path: .
-  sha256: 1d62614985a6f66d45a3a7876544c29612bd67f2e26176fbb9fedca6a08be13a
+  sha256: 9a1ac43f7b3bf37a17630ee0b49296bf3ee534ce0ddda1255dbc5b9945ad152e
   requires_dist:
   - coverage[toml] ; extra == 'test'
   requires_python: '>=3.10'

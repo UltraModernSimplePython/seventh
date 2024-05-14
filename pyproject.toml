@@ -12,6 +12,8 @@ test = ["coverage[toml]"]
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
 packages = ["seventh"]
 
 [tool.pixi.project]
