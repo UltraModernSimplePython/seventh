@@ -15,7 +15,9 @@ from seventh import __version__, wikipedia
     show_default=True,
 )
 @click.version_option(version=__version__)
-def main(language: str = "en") -> None:
+def main(
+    language: str = "en",  # The language edition of wikipedia
+) -> None:  # Just formats the output and returns None
     """The ultramodern Python project."""
     page = wikipedia.random_page(language=language)  # language=language needed here
     # title = data["title"]

@@ -8,6 +8,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["coverage[toml]"]
+docs = ["nbdev"]
 
 [build-system]
 requires = ["setuptools"]
@@ -58,7 +59,6 @@ python = "3.11.*"
 [tool.pixi.feature.docs.dependencies]
 quarto = ">=1.4.550,<1.5"
 jupyterlab = ">=4.2.0,<4.3"
-nbdev = ">=2.2.10,<2.3"
 
 [tool.pixi.feature.typing.dependencies]
 mypy = ">=0.812,<1.11"

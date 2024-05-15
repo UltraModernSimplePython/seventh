@@ -1,0 +1,7 @@
+website:
+  sidebar:
+    contents:
+      - index.qmd
+      - console.ipynb
+      - howmade.qmd
+      - wikipedia.ipynb

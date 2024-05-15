@@ -1,0 +1,882 @@
+---
+title: "How this was made: Ultra Modern and Simple Python"
+---
+
+This is a riff on Claudio JoloWicz's [Hyper Modern Python](https://medium.com/@cjolowicz/hypermodern-python-d44485d9d769) done in a way which:
+
+1. Simplifies the Python Stack
+2. Uses it to build both (pypi and conda-forge compatible) libraries and applications
+3. Brings other software like html, javascript, and css into the stack, in a modular fashion
+4. Uses new tooling based on rust such as uv, ruff, and pixi
+5. Simplifies the number of tools used
+6. Uses Jupyter but lets you refactor from jupyter to files. Makes sure jupyter kernels are self-contained.
+7. Uses github actions for various parts of builds/CD.
+8. Uses nbdev to document.
+9. Uses dirvenv for directory based environments
+10. Uses mypy for static typechecking and typeguard for run-time typechecking if needed
+
+## A simple command line application
+
+`pixi global install direnv`
+
+To your `.zshrc` add:
+`eval "$(direnv hook zsh)"`
+
+And then do:
+
+`source .zshrc` or start a new shell...
+
+Then lets create our project.
+
+```bash
+pixi init First --pyproject
+cd First
+pixi add python jupyterlab ipykernel pixi-kernel click
+```
+
+pixi creates editable installs by default if you are using `--pyproject`. This option is recommended for python packages. For complex packages they say to use pixi.toml.
+
+	I feel the distinction comes from whether you are going to build or not into a library. But for any ml project you want a editable install. You'll have to get this working in ci/cd as well.
+
+Lets create the appropriate folders:
+
+`mkdir first; touch first/__init__.py`
+
+In `__init__.py` we add:
+
+```python
+import importlib.metadata
+
+__version__ = importlib.metadata.version(__name__ or __package__)
+```
+
+and in `first/console.py` we add:
+
+```python
+import click
+from first import __version__
+import requests
+import textwrap
+
+API_URL = "https://en.wikipedia.org/api/rest_v1/page/random/summary"
+
+@click.command()
+@click.version_option(version=__version__)
+def main():
+    """The ultramodern Python project."""
+    with requests.get(API_URL) as response:
+        response.raise_for_status()
+        data = response.json()
+        title = data["title"]
+        extract = data["extract"]
+        click.secho(title, fg="green")
+        click.echo(textwrap.fill(extract))
+
+if __name__=="__main__":
+    main()
+
+```
+
+Now lets add this file as a task in `pixi`:
+
+`pixi task add first "python first/console.py"`
+
+now you can do:
+
+```bash
+pixi run first
+pixi run first --version
+```
+
+The latter should return 0.1.0
+
+## Testing
+
+The first thing we do is to create a copy of `first` called second`.
+
+Now in normal situations you would create a testing environment. `pixi` is quite general, so what we first do is create a testing feature instead, and fold that into a testing environment. In the future we can fold other stuff "features" into this testing environment. For example, we can create features for formatting and linting, and fold that all into a dev environment. Ditto for CI.
+
+`pixi add --feature test pytest`
+
+So we added the pytest package to the feature test. Now we'll make a test file to run tests:
+
+```bash
+mkdir tests
+touch tests/test_console.py
+```
+
+and in `test_console.py` we do:
+
+```python
+# tests/test_console.py
+import click.testing
+from second import console
+def test_main_succeeds():
+    runner = click.testing.CliRunner()
+    result = runner.invoke(console.main)
+    assert result.exit_code == 0
+```
+Now it is time to add the test environment. In `pyproject.toml` we do:
+
+```toml
+# Environments
+[tool.pixi.environments]
+default = { solve-group = "default" }
+test = { features = ["test"], solve-group = "default" }
+```
+
+so we create a test environment which augments the default. In addition there is this interesting notion of something called a `solve-group`. What is this?
+
+For environments we could do:
+
+```toml
+[environments]
+# implicit: default = ["default"]
+default = ["py39"] # implicit: default = ["py39", "default"]
+py310 = ["py310"] # implicit: py310 = ["py310", "default"]
+test = ["test"] # implicit: test = ["test", "default"]
+test39 = ["test", "py39"] # implicit: test39 = ["test", "py39", "default"]
+```
+The solve group is used to group environments together at the solve stage. This is useful for environments that need to have the same dependencies but might extend them with additional dependencies. For instance when testing a production environment with additional test dependencies.
+
+```toml
+[environments]
+# Creating a `prod` environment which is the minimal set of dependencies used for production.
+prod = {features = ["py39"], solve-group = "prod"}
+# Creating a `test_prod` environment which is the `prod` environment plus the `test` feature.
+test_prod = {features = ["py39", "test"], solve-group = "prod"}
+# Using the `solve-group` to solve the `prod` and `test_prod` environments together
+# Which makes sure the tested environment has the same version of the dependencies as the production environment.
+```
+
+Now you can run stuff in the test environment with `pixi run -e test python`.
+
+This enables us to create a task:
+
+```toml
+[tool.pixi.feature.test.tasks]
+test = "pytest"
+```
+
+and then doing `pixi run test` just does the right thing. It figures out that the `test` task calling pytest is available in the test environment and runs in that.
+
+If the environment cannot be uniquely resolved, you will be offered a choice...
+
+Now since the `clirunner` may need to be used for multiple tests we can create it as a `pytest` fixture, and use it in multiple tests.
+
+```python
+# tests/test_console.py
+import click.testing
+import pytest
+from second import console
+
+@pytest.fixture
+def runner():
+    return click.testing.CliRunner()
+
+def test_main_succeeds(runner):
+    result = runner.invoke(console.main)
+    assert result.exit_code == 0
+
+```
+
+### Adding coverage
+
+Adding coverage is simple.
+
+`pixi add --feature test pytest-cov`
+
+Then because we need optional dependencies and conda does not support those:
+
+`pixi add --feature test --pypi "coverage[toml]"`
+
+Now all you need to do if `pixi run test --cov` which gets ececuted in the test environment with the test feature and gives you coverage output.
+
+You can configure Coverage.py to require full test coverage (or any other target percentage) using the [fail_under](https://coverage.readthedocs.io/en/stable/config.html#report) option:
+
+```bash
+[tool.coverage.report]
+fail_under = 100
+```
+
+### Mocking
+
+We start by `pixi add --feature test pytest-mock`
+
+Unit tests should be [fast, isolated, and repeatable](http://agileinaflash.blogspot.com/2009/02/first.html). The test for `console.main`is neither of these:
+
+- It is not fast, because it takes a full round-trip to the Wikipedia API to complete.
+- It does not run in an isolated environment, because it sends out an actual request over the network.
+- It is not repeatable, because its outcome depends on the health, reachability, and behavior of the API. In particular, the test fails whenever the network is down.
+
+Now we can add a whole bunch of tests that show off the mock behavior. Notice how `mock` is returned as a fixture. It patched requests.get as a context manager:
+```python
+def main():
+    """The ultramodern Python project."""
+    with requests.get(API_URL) as response:
+        response.raise_for_status()
+        data = response.json()
+        title = data["title"]
+        extract = data["extract"]
+        click.secho(title, fg="green")
+        click.echo(textwrap.fill(extract))
+```
+
+by fake-calling the `__enter__` and `json` and mucking with their return values, and then we test against these fake values.
+
+```python
+@pytest.fixture
+def runner():
+    return click.testing.CliRunner()
+
+# def test_main_succeeds(runner):
+#     result = runner.invoke(console.main)
+#     assert result.exit_code == 0
+
+@pytest.fixture
+def mock_requests_get(mocker):
+    mock = mocker.patch("requests.get")
+    mock.return_value.__enter__.return_value.json.return_value = {
+            "title": "Lorem Ipsum",
+            "extract": "Lorem ipsum dolor sit amet",
+    }
+    return mock
+
+def test_main_succeeds(runner, mock_requests_get):
+    result = runner.invoke(console.main)
+    assert result.exit_code == 0
+
+def test_main_prints_title(runner, mock_requests_get):
+    result = runner.invoke(console.main)
+    assert "Lorem Ipsum" in result.output
+
+def test_main_invokes_requests_get(runner, mock_requests_get):
+    runner.invoke(console.main)
+    assert mock_requests_get.called
+
+def test_main_uses_correct_url(runner, mock_requests_get):
+    runner.invoke(console.main)
+    assert mock_requests_get.call_args == ((console.API_URL,),)
+
+def test_main_fails_on_request_error(runner, mock_requests_get):
+    mock_requests_get.side_effect = Exception("Boom")
+    result = runner.invoke(console.main)
+    assert result.exit_code == 1
+```
+
+### Refactoring using tests
+
+We can use the tests we have created to re-factor our code.
+
+We create a `wikipedia.py`:
+
+```python
+import requests
+API_URL = "https://en.wikipedia.org/api/rest_v1/page/random/summary"
+def random_page():
+    with requests.get(API_URL) as response:
+        response.raise_for_status()
+        return response.json()
+```
+
+and change the call in `console.py`:
+
+```python
+def main():
+    """The hypermodern Python project."""
+    data = wikipedia.random_page()    title = data["title"]
+    extract = data["extract"]    click.secho(title, fg="green")
+    click.echo(textwrap.fill(extract))
+```
+
+All the tests continue to run, because we have continued to mock `requests.get`.
+
+Now let us handle exceptions gracefully...
+
+```python
+import requests
+def test_main_prints_message_on_request_error(runner, mock_requests_get):
+    mock_requests_get.side_effect = requests.RequestException
+    result = runner.invoke(console.main)
+    assert "Error" in result.output
+```
+
+The test now fails. The test can be fixed with:
+
+```python
+def random_page():
+    try:
+        with requests.get(API_URL) as response:
+            response.raise_for_status()
+            return response.json()
+    except requests.RequestException as error:
+        message = str(error)
+        raise click.ClickException(message)
+```
+
+In the test we make sure we raise a `RequestException`; this is what happens if the internet breaks in-between client and server. However that does not lead to our test passing , because the result's output is not affected. We make this happen by making a `ClickException` with a stringified error message.
+
+Now lets add an option to choose the language..we start by writing a test in a new file `test_wikipedia.py`, and move the `mock_requests_get` fixture into `conftests.py` so it can be made available to anything...
+
+```python
+from third import wikipedia
+
+def test_random_page_uses_given_language(mock_requests_get):
+    wikipedia.random_page(language="de")
+    args, _ = mock_requests_get.call_args
+    assert "de.wikipedia.org" in args[0]
+```
+
+Now we need to fix `random_page` as we get `TypeError: random_page() got an unexpected keyword argument 'language'`...
+
+```python
+def random_page(language="en"):
+    try:
+        with requests.get(API_URL.format(language=language)) as response:
+            response.raise_for_status()
+            return response.json()
+    except requests.RequestException as error:
+        message = str(error)
+        raise click.ClickException(message)
+```
+
+We'll add a command-line option to choose the language now...we add a test...
+
+```python
+@pytest.fixture
+def mock_wikipedia_random_page(mocker):
+	return mocker.patch("hypermodern_python.wikipedia.random_page")
+def test_main_uses_specified_language(runner, mock_wikipedia_random_page):
+	runner.invoke(console.main, ["--language=pl"])
+	mock_wikipedia_random_page.assert_called_with(language="pl")
+```
+
+Now we add the click option:
+```python
+@click.command()
+@click.option(
+    "--language",
+    "-l",
+    default="en",
+    help="Language edition of Wikipedia",
+    metavar="LANG",
+    show_default=True,
+)
+@click.version_option(version=__version__)
+def main(language):
+    """The ultramodern Python project."""
+    data = wikipedia.random_page(language=language)
+    title = data["title"]
+    extract = data["extract"]
+    click.secho(title, fg="green")
+    click.echo(textwrap.fill(extract))
+```
+
+Now its all working
+
+### End to End Testing
+
+Ok we'd like to bring back the integration-like tests where we actually hit wikipedia instead of mocking it out, and using the mocks for TDD.
+
+## Test automation
+
+As a precursor for testing against various pythons, and then further under various operating systems, as github actions, we'd want to set up python environments corresponding to different versions of python. Back in the day, we;d use `tox` or `nox` to do this, but now this goodness is given to us by pixi, by its various features and environments.
+
+I had to make quite a few changes from the simple additions that i had earlier to get this to work. In particular, I had to loosen pixi's default restrictions on python versions being `>= 3.11`. I also had to make `python=*` in the default although i am not sure that was needed if the above restriction was removed. I also mistakenly used `~=` dependencies at the top level which bumped up everything to 3.12.
+
+Now the pyproject.toml looks like this...
+
+```toml
+[project]
+name = "fourth"
+version = "0.1.0"
+description = "Add a short description here"
+authors = [{ name = "Rahul Dave", email = "rahuldave@gmail.com" }]
+requires-python = ">= 3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["coverage[toml]"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.tasks]
+fourth = "python fourth/console.py"
+
+[tool.pixi.dependencies]
+pixi-kernel = ">=0.3.0,<0.4"
+jupyterlab = ">=4.2.0,<4.3"
+python = "*"
+ipykernel = ">=6.29.3,<6.30"
+click = ">=8.1.7,<8.2"
+
+[tool.pixi.pypi-dependencies]
+fourth = { path = ".", editable = true }
+
+[tool.pixi.feature.test.dependencies]
+pytest = ">=7.2.0,<8.3"
+pytest-cov = ">=5.0.0,<5.1"
+pytest-mock = ">=3.14.0,<3.15"
+
+[tool.pixi.feature.test.tasks]
+test = "pytest --cov -m 'not e2e'"
+teste2e = "pytest --cov -m 'e2e'"
+
+[tool.pixi.feature.py310.dependencies]
+python = "3.10.*"
+
+[tool.pixi.feature.py311.dependencies]
+python = "3.11.*"
+
+# Environments
+[tool.pixi.environments]
+default = { solve-group = "default" }
+test = { features = ["test"], solve-group = "default" }
+py310 = { features = ["py310"], solve-group = "py310" }
+py311 = { features = ["py311"], solve-group = "py311" }
+py310test = { features = ["py310", "test"], solve-group = "py310" }
+py311test = { features = ["py311", "test"], solve-group = "py311" }
+
+[tool.coverage.paths]
+source = ["fourth"]
+[tool.coverage.run]
+branch = true
+source = ["fourth"]
+[tool.coverage.report]
+show_missing = true
+```
+
+and now i can train on a matrix of test, py310test, and py311test. One could drop the py310 and py311 environments if one was pnly using them for testing. Notice how i set up different solve groups as well. I am not sure i need this but it ensures that if an older version of python cannot be so;ved into the default group it can construct a new group for it. I need to ask about this.
+
+In nox you can run multiple tests (sessions) together. I do not know what the equivalent for pixi is.
+
+Now we can push this up a notch by having a CI/CD pipeline.
+
+### CI/CD
+
+_Continuous integration_ (CI) helps you automate the integration of code changes into your project. When changes are pushed to the project repository, the CI server verifies their correctness, triggering tools such as unit tests, linters, or type checkers.
+
+[Pull Requests](https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/about-pull-requests) are an important building block in this workflow. They let you propose a set of changes to the repository, for example a specific bugfix or new feature. When the pull request gets accepted, its changes are merged into the target branch, typically master. GitHub displays Pull Requests with a green tick if they pass CI, and with a red x if the CI pipeline failed. In this way, continuous integration functions as a gate commits need to pass to enter the master branch.
+
+We'll take baby steps towards this by setting up our testing on github actions. Later, we'll create a more complex matrix of tests, including different platforms, and including formatting and linting. All of this will make sure that the contributions are in the format we desire..
+
+We create a folder `.github/workflows` and  creat a file `test.yaml` in there:
+
+```yaml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  tests-per-env:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        environment: [test, py310test, py311test]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Setup pixi
+        uses: prefix-dev/setup-pixi@v0.6.0
+        with:
+          environments: ${{ matrix.environment }}
+      - name: Test with Pixi
+        run: |
+          pixi run --environment ${{ matrix.environment }} test
+```
+
+this workflow will run in github actions on pushes and pull requests, basically running the test task in multiple test envoronments..
+
+## Lint and Format
+
+In the old days we'd use `black` and `flake8`. Now there is a faster option, `ruff` which makes things faster in local and ci/cd. To do this we'll `pixi add ruff --feature lintformat`.
+
+### Linting
+
+if you just do ``ruff check` you get:
+
+```bash
+❯ ruff check tests
+tests/test_console.py:39:1: E402 Module level import not at top of file
+Found 1 error.
+
+fifth on  main [?] is 📦 v0.1.0 via 🐍 v3.12.3 via 🅒 fifth
+❯ ruff check fifth
+All checks passed!
+```
+
+This is good. Lets fix the erroe in the tests folder by moving `import requests` to the top of the file.
+
+In the original post by Claudio, the FECW flags are chosen. Lets do that in ruff.
+
+- `F` are errors reported by [pyflakes](https://github.com/PyCQA/pyflakes), a tool which parses source files and finds invalid Python code.
+- `W` and `E` are warnings and errors reported by [pycodestyle](https://github.com/pycqa/pycodestyle), which checks your Python code against some of the style conventions in [PEP 8](http://www.python.org/dev/peps/pep-0008/).
+- `C` are violations reported by [mccabe](https://github.com/PyCQA/mccabe), which checks the code complexity of your Python package against a configured limit.
+
+In `ruff` we set that up as:
+
+```toml
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    "W",
+    # Pyflakes
+    "F",
+    # McCabe
+    "C"
+]
+mccabe.max-complexity = 10
+```
+We hget two warnings now:
+
+```bash
+❯ ruff check
+tests/test_console.py:50:1: W191 Indentation contains tabs
+tests/test_console.py:51:1: W191 Indentation contains tabs
+Found 2 errors.
+```
+
+Lets fix these.
+
+	Now we can try to do import sorting by adding "I" in `select`:
+
+```bash
+fifth on  main [?] is 📦 v0.1.0 via 🐍 v3.12.3 via 🅒 fifth
+❯ ruff check
+fifth/console.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+fifth/wikipedia.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+tests/test_console.py:2:1: I001 [*] Import block is un-sorted or un-formatted
+Found 3 errors.
+[*] 3 fixable with the `--fix` option.
+```
+
+We can let it fix the errors for us!
+
+Now we add `flake-bugbear` compatability which gives us all kinds of good ideas.
+
+```bash
+❯ ruff check
+fifth/wikipedia.py:15:9: B904 Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling
+Found 1 error.
+```
+
+And we fix this via `raise click.ClickException(message) from error`
+
+Now we add `flake8-bandit`, but exclude callas to `assert` (how to do this on a directory basis in ruff?)
+
+```bash
+❯ ruff check
+fifth/wikipedia.py:10:14: S113 Probable use of requests call without timeout
+Found 1 error.
+```
+
+We add a timeout in the requests call to fix...
+
+### Code Formatting
+
+The `ruff` formatter has been designed as a drop-in replacement for `black`.
+
+`ruff format`
+
+### Putting it into the tasks system
+
+We added a feature:
+
+```toml
+[tool.pixi.feature.lintformat.dependencies]
+ruff = ">=0.4.4,<0.5"
+```
+
+and some tasks for that feature:
+
+```toml
+[tool.pixi.feature.lintformat.tasks]
+lint = "ruff check"
+format = "ruff format"
+```
+
+and now we add in the environments:
+
+```toml
+[tool.pixi.environments]
+default = { solve-group = "default" }
+test = { features = ["test"], solve-group = "default" }
+dev = { features = ["test", "lintformat"], solve-group = "default" }
+py310 = { features = ["py310"], solve-group = "py310" }
+py311 = { features = ["py311"], solve-group = "py311" }
+py310dev = { features = ["py310", "test", "lintformat"], solve-group = "py310" }
+py311dev = { features = ["py311", "test", "lintformat"], solve-group = "py311" }
+py310test = { features = ["py310", "test"], solve-group = "py310" }
+py311test = { features = ["py311", "test"], solve-group = "py311" }
+```
+
+## Pre-commit
+
+You want formatting to run before you commit. This can be run as a pre-commit hook in git. There is a nice piece of software, `pre-commit` which allows you to create these hooks.
+
+I'll install it in the `lintformat` feature thus:
+
+`pixi add pre-commit --feature=lintformat`
+
+After doing this we need to add a `.pre-commit-config.yaml` in the root folder of the project:
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v2.3.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff-format
+        entry: pixi run --environment dev format
+        language: system
+        types: [python]
+```
+
+I'll use our local python 3.12 dev environment to do the formatting.
+
+Then run `pre-commit install`. This will install the hook. You are done. On the next commit, `pre-commit` will run all the hooks listed above and then open your editor to write your commit message.
+
+## Python Typing
+
+Python has non-compulsory typing which can nevertheless catch a lot of errors. You can use a typechecker for this purpose. We'll use `mypy`. Both Visual Studio Code and Zed also use pyright and pylance so we enable the use of the current `pixi shell` which i set in the environment `dev` to use these (the env is set up as `pixi shell --environment dev`):
+
+```toml
+[tool.pyright]
+venvPath = "."
+venv = ".pixi/envs/dev"
+```
+
+I install `mypy` in a new feature: `pixi add mypy --feature typing`. I then include this feature in all the `dev` environments, for eg.:
+
+`dev = { features = ["test", "lintformat", "typing"], solve-group = "default" }`
+
+and then configure `mypy`:
+
+```toml
+[tool.mypy]
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["requests", "pytest"]
+ignore_missing_imports = true
+```
+
+I also have the linter (`ruff lint`) add support for types (`flake8-annotations`):
+
+```toml
+[tool.ruff.lint]
+ignore = [
+    "E203",   # whitespace before ':'
+    "S101",   # use of assert detected, ignore for test-suite
+    "ANN401",
+]
+select = [
+    # pycodestyle
+    "E",
+    "W",
+    # Pyflakes
+    "F",
+    # McCabe
+    "C",
+    # # pyupgrade
+    # "UP",
+    # # flake8-bugbear
+    "B",
+    # flake8-bandit
+    "S",
+    # # flake8-simplify
+    # "SIM",
+    # isort
+    "I",
+    "ANN",
+]
+mccabe.max-complexity = 10
+
+[tool.ruff.lint.flake8-annotations]
+allow-star-arg-any = true
+ignore-fully-untyped = true
+```
+
+Now `ruff lint` will look for types not supplied as well.
+
+Now we add types all over the place, for example:
+
+`def random_page(language: str = "en") -> Any: ...`
+
+From `console.py`:
+
+```python
+def main(language: str = "en") -> None:
+    """The ultramodern Python project."""
+    page = wikipedia.random_page(language=language)  # language=language needed here
+    # title = data["title"]
+    # extract = data["extract"]
+    click.secho(page.title, fg="green")
+    click.echo(textwrap.fill(page.extract))
+```
+
+and a part of `test_console.py` for example:
+
+```python
+# tests/test_console.py
+from unittest.mock import Mock
+
+import pytest
+import requests
+from click.testing import CliRunner
+from pytest_mock import MockFixture
+
+from sixth import console, wikipedia
+
+
+@pytest.fixture
+def runner() -> CliRunner:
+    return CliRunner()
+
+@pytest.mark.e2e
+def test_main_succeeds_in_production_env(runner: CliRunner) -> None:
+    result = runner.invoke(console.main)
+    assert result.exit_code == 0
+
+
+def test_main_succeeds(runner: CliRunner, mock_requests_get: Mock) -> None:
+    result = runner.invoke(console.main)
+    assert result.exit_code == 0
+
+...
+
+@pytest.fixture
+def mock_wikipedia_random_page(mocker: MockFixture) -> Mock:
+    return mocker.patch("sixth.wikipedia.random_page")
+
+
+def test_main_uses_specified_language(
+    runner: CliRunner, mock_wikipedia_random_page: Mock
+) -> None:
+    runner.invoke(console.main, ["--language=pl"])
+    mock_wikipedia_random_page.assert_called_with(language="pl")
+```
+
+or in the test configurator `conftest.py`:
+
+```python
+from typing import Any
+from unittest.mock import Mock
+
+import pytest
+from pytest_mock import MockFixture
+
+
+def pytest_configure(config: Any) -> None:
+    config.addinivalue_line("markers", "e2e: mark as end-to-end test.")
+
+
+@pytest.fixture
+def mock_requests_get(mocker: MockFixture) -> Mock:
+    mock = mocker.patch("requests.get")
+    mock.return_value.__enter__.return_value.json.return_value = {
+        "title": "Lorem Ipsum",
+        "extract": "Lorem ipsum dolor sit amet",
+    }
+    return mock
+```
+
+### Replace `Any`s with pydantic
+
+`Any` is a good catch-all when you dont know how to type. One thing one would like to do with typing is to get type validation. Pydantic is a great source for this.
+
+In this case `Any` is not satisfactory. We want a type representing this wikipedia page. so after doing `pixi add pydantic`, we define a type for the page in `wikipedia.py`:
+
+```python
+import click
+import requests
+from pydantic import BaseModel, ValidationError
+
+
+class Page(BaseModel):
+    title: str
+    extract: str
+
+
+# API_URL = "https://en.wikipedia.org/api/rest_v1/page/random/summary"
+API_URL: str = "https://{language}.wikipedia.org/api/rest_v1/page/random/summary"
+
+
+def random_page(
+    language: str = "en",
+) -> Page:  # this is not a guaranteed keyword argument
+    try:
+        with requests.get(API_URL.format(language=language), timeout=10) as response:
+            response.raise_for_status()
+            data = response.json()
+            return Page(**data)
+    except (requests.RequestException, ValidationError) as error:
+        message: str = str(error)
+        raise click.ClickException(message) from error
+```
+
+The `Page(**data)` will construct a page object is the keys `title` and `extract` match in the json, else throw a `ValidationError`, which we now catch and re-throw. We add a test to deal with this, and a e2e test as well:
+
+```python
+@pytest.mark.e2e
+def test_random_page_returns_page(mock_requests_get: Mock) -> None:
+    page = wikipedia.random_page()
+    assert isinstance(page, wikipedia.Page)
+
+
+def test_random_page_handles_validation_errors(mock_requests_get: Mock) -> None:
+    mock_requests_get.return_value.__enter__.return_value.json.return_value = {}
+    with pytest.raises(click.ClickException): # title and excerpt not matched
+        wikipedia.random_page()
+```
+
+At this point run `mypy .`, `ruff lint` to catch any typing errors.
+
+We add a `typing` task in the `dev` environments:
+
+```python
+[tool.pixi.feature.typing.tasks]
+typing = "mypy ."
+```
+
+## Documentation
+
+There are many ways to document python. The old fashioned ways were via sphinx and read-the-docs: we're going to use nbdev/notebooks/qmd files and quarto, which allows us rich media documentation. One of our key goals is that documentation is not just automatically generated, but that thought is put into the documentation and many examples are provided, WITHOUT compromising the documentation inlaid with code and without making it too long. We also want to solve the DRY problem with python documentation where parameters are repeated in docstrings: for this we use "docments" from `fastcore` and `nbdev`. We also want to make sure to be able to run our documentation against the lastest code, ie the code we have in our dev environments when we generate it...documentation should never be out of sync.
+
+So, to summarize, we want:
+
+1. Automatically generated but thoughtful documentation, with not overly long code files.
+2. DRY documentation, which is run and thus in sync with current code
+3. Rich media documentation using notebooks and markdown files, which allows for high-quality html and pdf documentation using tools such as quarto and pandoc.
+
+Documentation for nbdev is [here](https://nbdev.fast.ai/explanations/docs.html#Deploying-Docs-With-GitHub-Actions).
+
+We do:
+
+`pixi add jupyterlab quarto --feature docs`
+
+I landed up having to get `nbdev` from pypi because the `conda-forge` channel has a very old version:
+
+`pixi add --pypi nbdev --feature docs`
+
+Then I add the docs feature to all the `dev` environments.
+
+We'll also create a `package = ['seventh']` so when we create a folder `notebooks` where we keep our testing, trying, documenting notebooks, so that it does not mess `setuptools` up.

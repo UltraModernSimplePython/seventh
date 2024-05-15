@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "seventh"
+  site-url: "https://UltraModernSimplePython.github.io/seventh"
+  description: "Ultra Modern Python Devel"
+  repo-branch: master
+  repo-url: "https://github.com/UltraModernSimplePython/seventh"
